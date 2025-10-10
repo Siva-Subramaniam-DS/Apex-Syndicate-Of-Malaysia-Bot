@@ -9,44 +9,49 @@ from typing import Optional
 import re
 import datetime
 import asyncio
-import glob
-from discord.ui import Button, View
 import pytz
-from PIL import Image, ImageDraw, ImageFont
-# Removed pilmoji import due to dependency issues
-import io
 import json
-from pathlib import Path
+import glob
+import io
 import requests
 import tempfile
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from discord.ui import Button, View
+from PIL import Image, ImageDraw, ImageFont
 
 # Load environment variables
 load_dotenv()
 
-# Channel IDs for event management
-CHANNEL_IDS = {
-    "take_schedule": 1281967638360359067,    # Schedule channel for posting match schedules
-    "results": 1281967703506026538,          # Results channel for posting match outcomes
-    "staff_attendance": 1378979992641339403  # Attendance channel for staff tracking
-}
-
-# Bot owner ID - has access to all commands
-BOT_OWNER_ID = 1251442077561131059
-
-# Role IDs for permissions
-ROLE_IDS = {
-    "judge": 1261723119257915412,        # Judge role
-    "bot_op": 1242280627991220275,       # Bot operator role
-    "organizer": 1314905337437880340,    # Organizer role
-    "bot_admin": 1242280443898761236     # Bot admin role (full server permissions)
-}
-
-# Branding constants
-ORGANIZATION_NAME = "ASM Tournament Bot"
-TOURNAMENT_SYSTEM_NAME = "ASM Tournament Bot"
-
-# Discord Application Public Key
-PUBLIC_KEY = "5ab0d9130b60c3e94c1c63319b1c938c98a362c215e0421d5369d6b3b2302bd5"
+# Import from modular components
+from config import CHANNEL_IDS, BOT_OWNER_ID, ROLE_IDS, ORGANIZATION_NAME, TOURNAMENT_SYSTEM_NAME
+from storage import (
+    scheduled_events, tournament_rules,
+    load_scheduled_events, save_scheduled_events,
+    load_rules, save_rules, get_current_rules, set_rules_content,
+    load_tour_panel_config, save_tour_panel_config
+)
+from utils import (
+    reminder_tasks, cleanup_tasks, judge_assignments,
+    has_organizer_permission, has_event_create_permission, has_event_result_permission,
+    find_field_index, remove_field_by_name, update_judge_field, remove_judge_field,
+    add_green_circle_to_title, update_embed_title_with_green_circle,
+    replace_green_circle_with_checkmark, update_embed_title_with_checkmark,
+    check_bot_permissions, can_judge_take_schedule, add_judge_assignment, remove_judge_assignment,
+    calculate_time_difference
+)
+from graphics import (
+    get_random_template, create_event_poster
+)
+from sheets import extract_sheet_id_from_url, fetch_sheet_data
+from reminders import (
+    send_ten_minute_reminder, schedule_ten_minute_reminder,
+    schedule_event_reminder_v2, schedule_event_cleanup
+)
+from views import (
+    TournamentPanelView, TakeScheduleButton,
+    RuleInputModal, RulesManagementView, display_rules
+)
 
 # Set Windows event loop policy for asyncio
 import sys
@@ -101,6 +106,191 @@ def save_scheduled_events():
             json.dump(data_to_save, f, indent=2)
     except Exception as e:
         print(f"Error saving scheduled events: {e}")
+
+# ===========================================================================================
+# Tournament Panel Configuration Storage
+
+TOUR_PANEL_CONFIG_FILE = "tour_panel_config.json"
+
+def load_tour_panel_config() -> dict:
+    try:
+        if os.path.exists(TOUR_PANEL_CONFIG_FILE):
+            with open(TOUR_PANEL_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading tour panel config: {e}")
+    return {}
+
+def save_tour_panel_config(config: dict) -> bool:
+    try:
+        with open(TOUR_PANEL_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error saving tour panel config: {e}")
+        return False
+
+def extract_sheet_id_from_url(url: str) -> str:
+    """Extract Google Sheets ID from various URL formats"""
+    try:
+        # Handle different Google Sheets URL formats
+        if '/spreadsheets/d/' in url:
+            match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+            if match:
+                return match.group(1)
+        elif 'docs.google.com/spreadsheets' in url:
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
+            if 'id' in query:
+                return query['id'][0]
+        
+        # If it's already just an ID
+        if re.match(r'^[a-zA-Z0-9-_]+$', url):
+            return url
+            
+        return None
+    except Exception as e:
+        print(f"Error extracting sheet ID: {e}")
+        return None
+
+async def fetch_sheet_data(sheet_url: str, team_name_col: str, captain_id_col: str) -> list:
+    """Fetch data from Google Sheets using public access (no auth required)"""
+    try:
+        sheet_id = extract_sheet_id_from_url(sheet_url)
+        if not sheet_id:
+            return []
+        
+        # Use Google Sheets API v4 public endpoint (read-only)
+        api_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/Sheet1"
+        
+        response = requests.get(api_url, timeout=10)
+        if response.status_code != 200:
+            print(f"Failed to fetch sheet data: {response.status_code}")
+            return []
+        
+        data = response.json()
+        values = data.get('values', [])
+        
+        if not values:
+            return []
+        
+        # Find column indices
+        headers = values[0] if values else []
+        team_name_idx = None
+        captain_id_idx = None
+        
+        for i, header in enumerate(headers):
+            if header.lower() == team_name_col.lower():
+                team_name_idx = i
+            elif header.lower() == captain_id_col.lower():
+                captain_id_idx = i
+        
+        if team_name_idx is None or captain_id_idx is None:
+            print(f"Could not find columns: {team_name_col}, {captain_id_col}")
+            return []
+        
+        # Extract team data
+        teams = []
+        for row in values[1:]:  # Skip header row
+            if len(row) > max(team_name_idx, captain_id_idx):
+                team_name = row[team_name_idx].strip()
+                captain_id = row[captain_id_idx].strip()
+                if team_name and captain_id:
+                    teams.append({
+                        'name': team_name,
+                        'captain_id': captain_id
+                    })
+        
+        return teams
+        
+    except Exception as e:
+        print(f"Error fetching sheet data: {e}")
+        return []
+
+class TournamentPanelView(discord.ui.View):
+    """Interactive view for tournament panel with registration buttons"""
+    
+    def __init__(self, tour_name: str, teams_data: list, config: dict):
+        super().__init__(timeout=None)  # Persistent view
+        self.tour_name = tour_name
+        self.teams_data = teams_data
+        self.config = config
+    
+    @discord.ui.button(label="📋 View Teams", style=discord.ButtonStyle.primary, emoji="👥")
+    async def view_teams(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show list of registered teams"""
+        if not self.teams_data:
+            await interaction.response.send_message("No teams registered yet.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"📋 Registered Teams - {self.tour_name}",
+            description=f"**Total Teams:** {len(self.teams_data)}",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Split teams into chunks to avoid embed limits
+        teams_text = ""
+        for i, team in enumerate(self.teams_data[:20], 1):  # Limit to 20 teams
+            teams_text += f"{i}. **{team['name']}** (Captain: <@{team['captain_id']}>)\n"
+        
+        if teams_text:
+            embed.add_field(name="Registered Teams", value=teams_text, inline=False)
+        
+        if len(self.teams_data) > 20:
+            embed.set_footer(text=f"Showing first 20 of {len(self.teams_data)} teams")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    @discord.ui.button(label="🔄 Refresh Data", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh_data(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Refresh team data from Google Sheet"""
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            # Re-fetch data from sheet
+            sheet_url = self.config.get('sheet', '')
+            team_name_col = self.config.get('columns', {}).get('team_name', '')
+            captain_id_col = self.config.get('columns', {}).get('captain_id', '')
+            
+            new_teams = await fetch_sheet_data(sheet_url, team_name_col, captain_id_col)
+            self.teams_data = new_teams
+            
+            await interaction.followup.send(f"✅ Refreshed! Found {len(new_teams)} teams.", ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error refreshing data: {e}", ephemeral=True)
+    
+    @discord.ui.button(label="📊 Tournament Info", style=discord.ButtonStyle.success, emoji="ℹ️")
+    async def tournament_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show tournament information"""
+        embed = discord.Embed(
+            title=f"📊 {self.tour_name} - Tournament Info",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        deadline = self.config.get('deadline', 'Not specified')
+        embed.add_field(name="📅 Registration Deadline", value=deadline, inline=False)
+        
+        sheet_url = self.config.get('sheet', '')
+        if sheet_url:
+            embed.add_field(name="📊 Registration Sheet", value=f"[View Sheet]({sheet_url})", inline=False)
+        
+        # Get channel mentions
+        channels = self.config.get('channels', {})
+        rules_channel_id = channels.get('rules')
+        if rules_channel_id:
+            embed.add_field(name="📋 Rules Channel", value=f"<#{rules_channel_id}>", inline=True)
+        
+        result_channel_id = channels.get('result')
+        if result_channel_id:
+            embed.add_field(name="🏆 Results Channel", value=f"<#{result_channel_id}>", inline=True)
+        
+        embed.add_field(name="👥 Registered Teams", value=f"{len(self.teams_data)}", inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Track per-event reminder tasks (for cancellation/update)
 reminder_tasks = {}
@@ -2208,6 +2398,145 @@ async def maps(interaction: discord.Interaction, count: int):
     await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="setup_tour_panel", description="Setup tour panel for the server")
+@app_commands.describe(
+    tour="Tournament name/title",
+    org_1="Organizer 1 role (mention)",
+    org_2="Organizer 2 role (mention)",
+    admin_role="Admin role (mention)",
+    open1="Channel for open1",
+    close="Channel for close",
+    result="Channel for results",
+    transcript="Channel for transcripts",
+    attendance="Channel for attendance",
+    sheet="Google sheet URL or ID",
+    deadline="Registration deadline text",
+    rules="Rules channel",
+    team_name_column="Sheet column for team name",
+    captain_id_column="Sheet column for captain ID",
+    open2="Channel for open2",
+    open3="Channel for open3",
+    custom_thumbnail="Custom thumbnail image URL (optional)"
+)
+async def setup_tour_panel(
+    interaction: discord.Interaction,
+    tour: str,
+    org_1: discord.Role,
+    org_2: discord.Role,
+    admin_role: discord.Role,
+    open1: discord.TextChannel,
+    close: discord.TextChannel,
+    result: discord.TextChannel,
+    transcript: discord.TextChannel,
+    attendance: discord.TextChannel,
+    sheet: str,
+    deadline: str,
+    rules: discord.TextChannel,
+    team_name_column: str,
+    captain_id_column: str,
+    open2: discord.TextChannel = None,
+    open3: discord.TextChannel = None,
+    custom_thumbnail: str = None,
+):
+    """Store tournament panel configuration and show a confirmation embed."""
+    try:
+        if not (discord.utils.get(interaction.user.roles, id=ROLE_IDS["bot_admin"]) or
+                discord.utils.get(interaction.user.roles, id=ROLE_IDS["organizer"])):
+            await interaction.response.send_message(
+                "❌ You need Bot Admin or Organizer role to setup the tour panel.", ephemeral=True
+            )
+            return
+
+        guild_id = str(interaction.guild.id)
+        config = load_tour_panel_config()
+        config[guild_id] = {
+            "tour": tour,
+            "org_1_role_id": org_1.id,
+            "org_2_role_id": org_2.id,
+            "admin_role_id": admin_role.id,
+            "channels": {
+                "open1": open1.id,
+                "open2": open2.id if open2 else None,
+                "open3": open3.id if open3 else None,
+                "close": close.id,
+                "result": result.id,
+                "transcript": transcript.id,
+                "attendance": attendance.id,
+                "rules": rules.id,
+            },
+            "sheet": sheet,
+            "deadline": deadline,
+            "columns": {
+                "team_name": team_name_column,
+                "captain_id": captain_id_column,
+            },
+            "custom_thumbnail": custom_thumbnail,
+            "updated_by": interaction.user.id,
+            "updated_at": datetime.datetime.utcnow().isoformat(),
+        }
+
+        ok = save_tour_panel_config(config)
+        if not ok:
+            await interaction.response.send_message("❌ Failed to save configuration.", ephemeral=True)
+            return
+
+        # Fetch team data from Google Sheet
+        await interaction.response.defer()
+        
+        teams_data = await fetch_sheet_data(sheet, team_name_column, captain_id_column)
+        
+        # Create the tournament panel embed
+        panel_embed = discord.Embed(
+            title=f"🏆 {tour} - Tournament Registration",
+            description=f"**Registration Deadline:** {deadline}\n\nUse the buttons below to interact with the tournament panel.",
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow(),
+        )
+        
+        panel_embed.add_field(name="👥 Registered Teams", value=f"{len(teams_data)}", inline=True)
+        panel_embed.add_field(name="📋 Rules", value=rules.mention, inline=True)
+        panel_embed.add_field(name="🏆 Results", value=result.mention, inline=True)
+        
+        panel_embed.add_field(
+            name="📊 Registration Sheet", 
+            value=f"[View & Register Here]({sheet})", 
+            inline=False
+        )
+        
+        panel_embed.add_field(
+            name="👑 Organizers", 
+            value=f"{org_1.mention}, {org_2.mention}", 
+            inline=False
+        )
+        
+        if custom_thumbnail:
+            panel_embed.set_thumbnail(url=custom_thumbnail)
+        
+        panel_embed.set_footer(text=f"{ORGANIZATION_NAME} • Panel created by {interaction.user.name}")
+        
+        # Create interactive view with team data
+        view = TournamentPanelView(tour, teams_data, config[guild_id])
+        
+        # Send the panel
+        panel_message = await interaction.followup.send(embed=panel_embed, view=view)
+        
+        # Send confirmation to user
+        confirm_embed = discord.Embed(
+            title="✅ Tour Panel Created Successfully!",
+            description=f"Tournament panel for **{tour}** has been created and posted.",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+        confirm_embed.add_field(name="📊 Teams Found", value=f"{len(teams_data)} teams loaded from sheet", inline=True)
+        confirm_embed.add_field(name="📝 Panel Message", value=f"[View Panel]({panel_message.jump_url})", inline=True)
+        confirm_embed.set_footer(text=f"{ORGANIZATION_NAME} • Setup by {interaction.user.name}")
+        
+        await interaction.followup.send(embed=confirm_embed, ephemeral=True)
+
+    except Exception as e:
+        print(f"Error in setup_tour_panel: {e}")
+        await interaction.response.send_message("❌ An error occurred while setting up the tour panel.", ephemeral=True)
+
 @tree.command(name="choose", description="Randomly choose from a list of options")
 @app_commands.describe(
     options="List of options separated by commas"
@@ -2904,6 +3233,724 @@ async def general_tie_breaker(
     embed.set_footer(text=f"Tie Breaker • Calculated by {interaction.user.display_name}")
     
     await interaction.response.send_message(embed=embed)
+
+
+# ===========================================================================================
+# ADDITIONAL EVENT MANAGEMENT COMMANDS
+# ===========================================================================================
+
+@tree.command(name="event-list", description="List all upcoming events")
+async def event_list(interaction: discord.Interaction):
+    """List all upcoming scheduled events"""
+    try:
+        if not scheduled_events:
+            embed = discord.Embed(
+                title="📅 Scheduled Events",
+                description="No events are currently scheduled.",
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+        
+        # Sort events by datetime
+        sorted_events = sorted(
+            scheduled_events.items(),
+            key=lambda x: x[1].get('datetime', datetime.datetime.min)
+        )
+        
+        embed = discord.Embed(
+            title="📅 Upcoming Events",
+            description=f"**Total Events:** {len(scheduled_events)}",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Show next 10 events
+        for i, (event_id, event_data) in enumerate(sorted_events[:10]):
+            event_datetime = event_data.get('datetime')
+            if not event_datetime:
+                continue
+                
+            # Format time
+            time_info = calculate_time_difference(event_datetime)
+            time_str = time_info.get('utc_time', 'Unknown time')
+            
+            # Get event details
+            team1 = event_data.get('team1_captain', 'Unknown')
+            team2 = event_data.get('team2_captain', 'Unknown')
+            judge = event_data.get('judge', 'Unassigned')
+            
+            # Format judge name
+            if isinstance(judge, discord.Member):
+                judge_name = judge.display_name
+            else:
+                judge_name = str(judge) if judge else 'Unassigned'
+            
+            event_info = f"**Time:** {time_str}\n"
+            event_info += f"**Teams:** {team1} vs {team2}\n"
+            event_info += f"**Judge:** {judge_name}\n"
+            
+            # Add status indicator
+            if judge_name != 'Unassigned':
+                status = "🟢 Ready"
+            else:
+                status = "🟡 Pending Judge"
+            
+            embed.add_field(
+                name=f"{status} Event {i+1}",
+                value=event_info,
+                inline=True
+            )
+        
+        if len(scheduled_events) > 10:
+            embed.set_footer(text=f"Showing first 10 of {len(scheduled_events)} events")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in event_list: {e}")
+        await interaction.response.send_message("❌ An error occurred while listing events.", ephemeral=True)
+
+
+@tree.command(name="event-status", description="Check status of events in current channel")
+async def event_status(interaction: discord.Interaction):
+    """Check status of events in the current channel"""
+    try:
+        current_channel_id = interaction.channel.id
+        channel_events = []
+        
+        # Find events in this channel
+        for event_id, event_data in scheduled_events.items():
+            event_channel_id = event_data.get('event_channel_id')
+            if event_channel_id == current_channel_id:
+                channel_events.append((event_id, event_data))
+        
+        if not channel_events:
+            embed = discord.Embed(
+                title="📊 Channel Event Status",
+                description="No events found in this channel.",
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="📊 Channel Event Status",
+            description=f"**Events in this channel:** {len(channel_events)}",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        for event_id, event_data in channel_events:
+            event_datetime = event_data.get('datetime')
+            if not event_datetime:
+                continue
+                
+            time_info = calculate_time_difference(event_datetime)
+            time_str = time_info.get('utc_time', 'Unknown time')
+            
+            team1 = event_data.get('team1_captain', 'Unknown')
+            team2 = event_data.get('team2_captain', 'Unknown')
+            judge = event_data.get('judge', 'Unassigned')
+            
+            if isinstance(judge, discord.Member):
+                judge_name = judge.display_name
+                status = "🟢 Ready"
+            else:
+                judge_name = str(judge) if judge else 'Unassigned'
+                status = "🟡 Pending Judge"
+            
+            embed.add_field(
+                name=f"{status} Match",
+                value=f"**Time:** {time_str}\n**Teams:** {team1} vs {team2}\n**Judge:** {judge_name}",
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in event_status: {e}")
+        await interaction.response.send_message("❌ An error occurred while checking event status.", ephemeral=True)
+
+
+@tree.command(name="event-refresh", description="Refresh event information")
+async def event_refresh(interaction: discord.Interaction):
+    """Refresh event information and update displays"""
+    try:
+        if not has_event_create_permission(interaction):
+            await interaction.response.send_message("❌ You don't have permission to refresh events.", ephemeral=True)
+            return
+        
+        # Reload scheduled events from file
+        load_scheduled_events()
+        
+        embed = discord.Embed(
+            title="🔄 Events Refreshed",
+            description=f"Successfully refreshed {len(scheduled_events)} events from storage.",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Show summary
+        total_events = len(scheduled_events)
+        events_with_judges = sum(1 for event_data in scheduled_events.values() 
+                               if event_data.get('judge'))
+        pending_judges = total_events - events_with_judges
+        
+        embed.add_field(
+            name="📊 Summary",
+            value=f"**Total Events:** {total_events}\n"
+                  f"**Ready:** {events_with_judges}\n"
+                  f"**Pending Judges:** {pending_judges}",
+            inline=True
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in event_refresh: {e}")
+        await interaction.response.send_message("❌ An error occurred while refreshing events.", ephemeral=True)
+
+
+@tree.command(name="help", description="Show all available commands")
+async def help_command(interaction: discord.Interaction):
+    """Show help information and available commands"""
+    try:
+        embed = discord.Embed(
+            title="🤖 ASM Tournament Bot - Help",
+            description="Here are all available commands:",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Event Management Commands
+        embed.add_field(
+            name="📅 Event Management",
+            value="`/event-create` - Create a new event\n"
+                  "`/event-list` - List all upcoming events\n"
+                  "`/event-status` - Check events in current channel\n"
+                  "`/event-refresh` - Refresh event information\n"
+                  "`/event-edit` - Edit an existing event\n"
+                  "`/event-delete` - Delete a scheduled event\n"
+                  "`/event-result` - Record match results\n"
+                  "`/unassigned_events` - List events without judges\n"
+                  "`/exchange_judge` - Exchange judges for events",
+            inline=False
+        )
+        
+        # Tournament Commands
+        embed.add_field(
+            name="🏆 Tournament Tools",
+            value="`/rules` - Manage tournament rules\n"
+                  "`/team_balance` - Balance teams by player levels\n"
+                  "`/add_captain` - Add captains to matches\n"
+                  "`/setup_tour_panel` - Setup tournament panel\n"
+                  "`/general_tie_breaker` - Break ties between teams",
+            inline=False
+        )
+        
+        # Utility Commands
+        embed.add_field(
+            name="🛠️ Utilities",
+            value="`/time` - Get random match time\n"
+                  "`/maps` - Randomly select maps\n"
+                  "`/choose` - Randomly choose from options\n"
+                  "`/ping` - Check bot latency\n"
+                  "`/help` - Show this help message",
+            inline=False
+        )
+        
+        # Staff Commands
+        embed.add_field(
+            name="👥 Staff Management",
+            value="`/staff-count` - Get staff count from database\n"
+                  "`/staff-update` - Manually update staff count\n"
+                  "`/staff-history` - Show staff count history",
+            inline=False
+        )
+        
+        # Admin Commands
+        embed.add_field(
+            name="⚙️ Admin Only",
+            value="`/backup` - Backup tournament data\n"
+                  "`/restore` - Restore from backup\n"
+                  "`/stats` - Show bot usage statistics",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Use /help to see this message again")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in help_command: {e}")
+        await interaction.response.send_message("❌ An error occurred while showing help.", ephemeral=True)
+
+
+@tree.command(name="ping", description="Check bot latency and status")
+async def ping_command(interaction: discord.Interaction):
+    """Check bot latency and connection status"""
+    try:
+        # Calculate latency
+        latency = round(bot.latency * 1000)
+        
+        # Determine status based on latency
+        if latency < 100:
+            status = "🟢 Excellent"
+            color = discord.Color.green()
+        elif latency < 200:
+            status = "🟡 Good"
+            color = discord.Color.yellow()
+        else:
+            status = "🔴 Poor"
+            color = discord.Color.red()
+        
+        embed = discord.Embed(
+            title="🏓 Bot Status",
+            description=f"**Latency:** {latency}ms\n**Status:** {status}",
+            color=color,
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Add additional info
+        embed.add_field(
+            name="📊 Statistics",
+            value=f"**Guilds:** {len(bot.guilds)}\n"
+                  f"**Scheduled Events:** {len(scheduled_events)}\n"
+                  f"**Active Tasks:** {len(reminder_tasks)}",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Uptime: {discord.utils.format_dt(discord.utils.utcnow(), 'R')}")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in ping_command: {e}")
+        await interaction.response.send_message("❌ An error occurred while checking bot status.", ephemeral=True)
+
+
+# ===========================================================================================
+# STAFF TRACKING COMMANDS
+# ===========================================================================================
+
+@tree.command(name="staff-count", description="Get staff count from database")
+async def staff_count(interaction: discord.Interaction):
+    """Get current staff count from the Google Sheets database"""
+    try:
+        # Staff database URL
+        staff_sheet_url = "https://docs.google.com/spreadsheets/d/1mExHYMn6qix_Xpoyzdkp9wxgdjG2RUoN4cZCUgY5aU8/edit?usp=sharing"
+        
+        await interaction.response.defer()
+        
+        # Try to fetch staff data (this will work if sheet is publicly accessible)
+        try:
+            staff_data = await fetch_sheet_data(staff_sheet_url, "Name", "Role")  # Adjust column names as needed
+            
+            if not staff_data:
+                # If direct fetch fails, show manual instructions
+                embed = discord.Embed(
+                    title="👥 Staff Database",
+                    description="**Staff Database URL:**\n[View Staff Sheet](https://docs.google.com/spreadsheets/d/1mExHYMn6qix_Xpoyzdkp9wxgdjG2RUoN4cZCUgY5aU8/edit?usp=sharing)",
+                    color=discord.Color.blue(),
+                    timestamp=discord.utils.utcnow()
+                )
+                
+                embed.add_field(
+                    name="📊 Manual Check",
+                    value="Please check the sheet manually for current staff count.\n\n"
+                          "**Instructions:**\n"
+                          "1. Click the link above\n"
+                          "2. Count active staff members\n"
+                          "3. Use `/staff-update` to record the count",
+                    inline=False
+                )
+                
+                embed.set_footer(text=f"{ORGANIZATION_NAME} • Staff Management")
+                
+                await interaction.followup.send(embed=embed)
+                return
+            
+            # Process staff data
+            total_staff = len(staff_data)
+            
+            # Count by roles (if role column exists)
+            role_counts = {}
+            for staff in staff_data:
+                role = staff.get('role', 'Unknown').strip()
+                role_counts[role] = role_counts.get(role, 0) + 1
+            
+            embed = discord.Embed(
+                title="👥 Staff Count",
+                description=f"**Total Active Staff:** {total_staff}",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            # Add role breakdown
+            if role_counts:
+                role_text = ""
+                for role, count in role_counts.items():
+                    role_text += f"**{role}:** {count}\n"
+                
+                embed.add_field(
+                    name="📋 Role Breakdown",
+                    value=role_text,
+                    inline=True
+                )
+            
+            embed.add_field(
+                name="📊 Database Info",
+                value=f"**Last Updated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                      f"**Source:** [Staff Database]({staff_sheet_url})",
+                inline=True
+            )
+            
+            embed.set_footer(text=f"{ORGANIZATION_NAME} • Staff Management")
+            
+            await interaction.followup.send(embed=embed)
+            
+        except Exception as fetch_error:
+            print(f"Error fetching staff data: {fetch_error}")
+            
+            # Fallback to manual check
+            embed = discord.Embed(
+                title="👥 Staff Database Access",
+                description="Unable to automatically fetch staff data.",
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            embed.add_field(
+                name="🔗 Staff Database",
+                value="[Open Staff Sheet](https://docs.google.com/spreadsheets/d/1mExHYMn6qix_Xpoyzdkp9wxgdjG2RUoN4cZCUgY5aU8/edit?usp=sharing)",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="📝 Manual Update",
+                value="Use `/staff-update` to manually record staff count after checking the sheet.",
+                inline=False
+            )
+            
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in staff_count: {e}")
+        await interaction.followup.send("❌ An error occurred while fetching staff data.", ephemeral=True)
+
+
+@tree.command(name="staff-update", description="Manually update staff count (Staff only)")
+async def staff_update(interaction: discord.Interaction, count: int, notes: str = None):
+    """Manually update staff count with optional notes"""
+    try:
+        # Check if user has staff permissions
+        if not has_event_create_permission(interaction):
+            await interaction.response.send_message("❌ You don't have permission to update staff count.", ephemeral=True)
+            return
+        
+        # Store staff count data
+        staff_data = {
+            'count': count,
+            'updated_by': interaction.user.display_name,
+            'updated_at': datetime.datetime.now().isoformat(),
+            'notes': notes or "No additional notes"
+        }
+        
+        # Save to a staff count file
+        try:
+            with open('staff_count.json', 'w') as f:
+                json.dump(staff_data, f, indent=2)
+        except Exception as e:
+            print(f"Error saving staff count: {e}")
+        
+        embed = discord.Embed(
+            title="👥 Staff Count Updated",
+            description=f"**New Staff Count:** {count}",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        embed.add_field(
+            name="📝 Update Details",
+            value=f"**Updated by:** {interaction.user.display_name}\n"
+                  f"**Time:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                  f"**Notes:** {notes or 'None'}",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔗 Database Reference",
+            value="[Staff Database](https://docs.google.com/spreadsheets/d/1mExHYMn6qix_Xpoyzdkp9wxgdjG2RUoN4cZCUgY5aU8/edit?usp=sharing)",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Staff Management")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in staff_update: {e}")
+        await interaction.response.send_message("❌ An error occurred while updating staff count.", ephemeral=True)
+
+
+@tree.command(name="staff-history", description="Show staff count history")
+async def staff_history(interaction: discord.Interaction):
+    """Show recent staff count updates"""
+    try:
+        # Try to load staff count history
+        try:
+            with open('staff_count.json', 'r') as f:
+                staff_data = json.load(f)
+        except FileNotFoundError:
+            embed = discord.Embed(
+                title="📊 Staff History",
+                description="No staff count data found. Use `/staff-update` to record the first count.",
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="📊 Staff Count History",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Parse datetime
+        updated_at = datetime.datetime.fromisoformat(staff_data['updated_at'])
+        
+        embed.add_field(
+            name="👥 Current Count",
+            value=f"**{staff_data['count']}** active staff members",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📝 Last Updated",
+            value=f"**By:** {staff_data['updated_by']}\n"
+                  f"**When:** {updated_at.strftime('%Y-%m-%d %H:%M')}",
+            inline=True
+        )
+        
+        if staff_data.get('notes'):
+            embed.add_field(
+                name="📋 Notes",
+                value=staff_data['notes'],
+                inline=False
+            )
+        
+        embed.add_field(
+            name="🔗 Database Reference",
+            value="[Staff Database](https://docs.google.com/spreadsheets/d/1mExHYMn6qix_Xpoyzdkp9wxgdjG2RUoN4cZCUgY5aU8/edit?usp=sharing)",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Staff Management")
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in staff_history: {e}")
+        await interaction.response.send_message("❌ An error occurred while fetching staff history.", ephemeral=True)
+
+
+# ===========================================================================================
+# ADMIN BACKUP AND RESTORE COMMANDS
+# ===========================================================================================
+
+@tree.command(name="backup", description="Backup tournament data (Bot Owner only)")
+async def backup_data(interaction: discord.Interaction):
+    """Backup all tournament data to files"""
+    try:
+        # Check if user is bot owner
+        if interaction.user.id != BOT_OWNER_ID:
+            await interaction.response.send_message("❌ Only the bot owner can backup data.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Create backup timestamp
+        backup_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Backup scheduled events
+        events_backup = f"scheduled_events_backup_{backup_time}.json"
+        save_scheduled_events()  # Save current state
+        
+        # Backup rules
+        rules_backup = f"tournament_rules_backup_{backup_time}.json"
+        
+        # Backup tour panel config
+        config_backup = f"tour_panel_config_backup_{backup_time}.json"
+        
+        embed = discord.Embed(
+            title="💾 Backup Complete",
+            description="Tournament data has been backed up successfully!",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        embed.add_field(
+            name="📁 Backup Files Created",
+            value=f"• `{events_backup}`\n"
+                  f"• `{rules_backup}`\n"
+                  f"• `{config_backup}`",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📊 Data Summary",
+            value=f"**Events:** {len(scheduled_events)}\n"
+                  f"**Rules:** {'Set' if get_current_rules() else 'None'}\n"
+                  f"**Config:** {'Set' if load_tour_panel_config() else 'None'}",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"Backup created by {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in backup_data: {e}")
+        await interaction.followup.send("❌ An error occurred while creating backup.", ephemeral=True)
+
+
+@tree.command(name="restore", description="Restore tournament data from backup (Bot Owner only)")
+async def restore_data(interaction: discord.Interaction):
+    """Restore tournament data from backup files"""
+    try:
+        # Check if user is bot owner
+        if interaction.user.id != BOT_OWNER_ID:
+            await interaction.response.send_message("❌ Only the bot owner can restore data.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Look for backup files
+        backup_files = []
+        for file in os.listdir('.'):
+            if file.startswith(('scheduled_events_backup_', 'tournament_rules_backup_', 'tour_panel_config_backup_')):
+                backup_files.append(file)
+        
+        if not backup_files:
+            await interaction.followup.send("❌ No backup files found in the current directory.", ephemeral=True)
+            return
+        
+        # Show available backups
+        embed = discord.Embed(
+            title="📂 Available Backups",
+            description="Found the following backup files:",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        for backup_file in backup_files:
+            file_time = os.path.getmtime(backup_file)
+            file_date = datetime.datetime.fromtimestamp(file_time).strftime("%Y-%m-%d %H:%M:%S")
+            embed.add_field(
+                name=f"📄 {backup_file}",
+                value=f"Created: {file_date}",
+                inline=False
+            )
+        
+        embed.add_field(
+            name="⚠️ Warning",
+            value="Restoring will **overwrite** current data. Make sure you have a recent backup before proceeding!",
+            inline=False
+        )
+        
+        embed.set_footer(text="Use the backup file names to restore specific data")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in restore_data: {e}")
+        await interaction.followup.send("❌ An error occurred while checking for backups.", ephemeral=True)
+
+
+@tree.command(name="stats", description="Show bot usage statistics (Bot Owner only)")
+async def bot_stats(interaction: discord.Interaction):
+    """Show bot usage and performance statistics"""
+    try:
+        # Check if user is bot owner
+        if interaction.user.id != BOT_OWNER_ID:
+            await interaction.response.send_message("❌ Only the bot owner can view statistics.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Calculate statistics
+        total_events = len(scheduled_events)
+        events_with_judges = sum(1 for event_data in scheduled_events.values() 
+                               if event_data.get('judge'))
+        pending_judges = total_events - events_with_judges
+        
+        active_reminders = len(reminder_tasks)
+        active_cleanups = len(cleanup_tasks)
+        
+        # Judge assignments
+        total_assignments = sum(len(assignments) for assignments in judge_assignments.values())
+        active_judges = len(judge_assignments)
+        
+        embed = discord.Embed(
+            title="📊 Bot Statistics",
+            description="Current bot usage and performance metrics",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Event Statistics
+        embed.add_field(
+            name="📅 Event Statistics",
+            value=f"**Total Events:** {total_events}\n"
+                  f"**Ready Events:** {events_with_judges}\n"
+                  f"**Pending Judges:** {pending_judges}\n"
+                  f"**Completion Rate:** {(events_with_judges/total_events*100):.1f}%" if total_events > 0 else "**Completion Rate:** N/A",
+            inline=True
+        )
+        
+        # System Statistics
+        embed.add_field(
+            name="⚙️ System Statistics",
+            value=f"**Active Reminders:** {active_reminders}\n"
+                  f"**Active Cleanups:** {active_cleanups}\n"
+                  f"**Bot Latency:** {round(bot.latency * 1000)}ms\n"
+                  f"**Guilds Connected:** {len(bot.guilds)}",
+            inline=True
+        )
+        
+        # Judge Statistics
+        embed.add_field(
+            name="👨‍⚖️ Judge Statistics",
+            value=f"**Active Judges:** {active_judges}\n"
+                  f"**Total Assignments:** {total_assignments}\n"
+                  f"**Avg per Judge:** {total_assignments/active_judges:.1f}" if active_judges > 0 else "**Avg per Judge:** N/A",
+            inline=True
+        )
+        
+        # Storage Statistics
+        rules_size = len(get_current_rules())
+        tour_config = load_tour_panel_config()
+        config_items = len(tour_config) if tour_config else 0
+        
+        embed.add_field(
+            name="💾 Storage Statistics",
+            value=f"**Rules Length:** {rules_size} chars\n"
+                  f"**Config Items:** {config_items}\n"
+                  f"**Data Files:** 3 (events, rules, config)",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Statistics generated at {datetime.datetime.now().strftime('%H:%M:%S')}")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in bot_stats: {e}")
+        await interaction.followup.send("❌ An error occurred while generating statistics.", ephemeral=True)
 
 
 if __name__ == "__main__":
