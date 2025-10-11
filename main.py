@@ -29,7 +29,11 @@ from storage import (
     scheduled_events, tournament_rules,
     load_scheduled_events, save_scheduled_events,
     load_rules, save_rules, get_current_rules, set_rules_content,
-    load_tour_panel_config, save_tour_panel_config
+    load_tour_panel_config, save_tour_panel_config,
+    load_org_role_config, save_org_role_config, get_org_role_config,
+    set_org_role_channel, set_org_role_spreadsheet,
+    add_org_role_posted_message, get_org_role_posted_messages,
+    update_org_role_posted_message
 )
 from utils import (
     reminder_tasks, cleanup_tasks, judge_assignments,
@@ -1360,6 +1364,9 @@ async def on_ready():
     
     # Load tournament rules from file
     load_rules()
+    
+    # Load org role configuration from file
+    load_org_role_config()
     
     # Reschedule cleanups for any events already marked finished_on if needed (optional)
     try:
@@ -3951,6 +3958,521 @@ async def bot_stats(interaction: discord.Interaction):
     except Exception as e:
         print(f"Error in bot_stats: {e}")
         await interaction.followup.send("❌ An error occurred while generating statistics.", ephemeral=True)
+
+
+# ===========================================================================================
+# ORG ROLE COMMANDS
+# ===========================================================================================
+
+@tree.command(name="set_channel_org_role", description="Set the channel for posting participant lists (Organizer only)")
+@app_commands.describe(
+    channel="The channel where participant lists will be posted"
+)
+async def set_channel_org_role(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Set the channel for org role participant posts"""
+    try:
+        # Check permissions
+        if not has_organizer_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You need Organizer role to use this command.", 
+                ephemeral=True
+            )
+            return
+        
+        guild_id = str(interaction.guild.id)
+        success = set_org_role_channel(guild_id, channel.id, interaction.user.id)
+        
+        if success:
+            embed = discord.Embed(
+                title="✅ Channel Set Successfully",
+                description=f"Participant lists will now be posted to {channel.mention}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Channel ID", value=str(channel.id), inline=True)
+            embed.add_field(name="Set by", value=interaction.user.mention, inline=True)
+            embed.set_footer(text=f"{ORGANIZATION_NAME} • Org Role Management")
+            
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message(
+                "❌ Failed to save channel configuration.", 
+                ephemeral=True
+            )
+            
+    except Exception as e:
+        print(f"Error in set_channel_org_role: {e}")
+        await interaction.response.send_message(
+            "❌ An error occurred while setting the channel.", 
+            ephemeral=True
+        )
+
+
+@tree.command(name="set_spreadsheet_org_role", description="Set the Google Spreadsheet for participant data (Organizer only)")
+@app_commands.describe(
+    spreadsheet_url="Google Sheets URL or ID",
+    team_name_column="Column name for team names (e.g., 'Team Name')",
+    captain_id_column="Column name for captain Discord IDs (e.g., 'Captain ID')"
+)
+async def set_spreadsheet_org_role(
+    interaction: discord.Interaction, 
+    spreadsheet_url: str,
+    team_name_column: str,
+    captain_id_column: str
+):
+    """Set the spreadsheet configuration for org role"""
+    try:
+        # Check permissions
+        if not has_organizer_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You need Organizer role to use this command.", 
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        # Validate spreadsheet by attempting to fetch data
+        sheet_id = extract_sheet_id_from_url(spreadsheet_url)
+        if not sheet_id:
+            await interaction.followup.send(
+                "❌ Invalid Google Sheets URL or ID.", 
+                ephemeral=True
+            )
+            return
+        
+        # Try to fetch data to validate
+        teams = await fetch_sheet_data(spreadsheet_url, team_name_column, captain_id_column)
+        
+        if teams is None or len(teams) == 0:
+            await interaction.followup.send(
+                f"⚠️ Could not fetch data from spreadsheet. Please check:\n"
+                f"• The spreadsheet is publicly accessible\n"
+                f"• Column names '{team_name_column}' and '{captain_id_column}' exist\n"
+                f"• The sheet contains data",
+                ephemeral=True
+            )
+            return
+        
+        guild_id = str(interaction.guild.id)
+        success = set_org_role_spreadsheet(
+            guild_id, 
+            spreadsheet_url, 
+            team_name_column, 
+            captain_id_column,
+            interaction.user.id
+        )
+        
+        if success:
+            embed = discord.Embed(
+                title="✅ Spreadsheet Set Successfully",
+                description=f"Found **{len(teams)}** teams in the spreadsheet",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Sheet ID", value=f"`{sheet_id}`", inline=False)
+            embed.add_field(name="Team Name Column", value=team_name_column, inline=True)
+            embed.add_field(name="Captain ID Column", value=captain_id_column, inline=True)
+            embed.add_field(name="Set by", value=interaction.user.mention, inline=True)
+            
+            # Show first 5 teams as preview
+            if teams:
+                preview = "\n".join([f"{i+1}. {team['name']} (Captain: {team['captain_id']})" 
+                                    for i, team in enumerate(teams[:5])])
+                if len(teams) > 5:
+                    preview += f"\n... and {len(teams) - 5} more"
+                embed.add_field(name="Preview (First 5 Teams)", value=preview, inline=False)
+            
+            embed.set_footer(text=f"{ORGANIZATION_NAME} • Org Role Management")
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(
+                "❌ Failed to save spreadsheet configuration.", 
+                ephemeral=True
+            )
+            
+    except Exception as e:
+        print(f"Error in set_spreadsheet_org_role: {e}")
+        await interaction.followup.send(
+            f"❌ An error occurred while setting the spreadsheet: {e}", 
+            ephemeral=True
+        )
+
+
+@tree.command(name="check_duplicates_org_role", description="Check for duplicate teams in the spreadsheet (Organizer only)")
+async def check_duplicates_org_role(interaction: discord.Interaction):
+    """Check for duplicate team names or captain IDs in the spreadsheet"""
+    try:
+        # Check permissions
+        if not has_organizer_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You need Organizer role to use this command.", 
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        guild_id = str(interaction.guild.id)
+        config = get_org_role_config(guild_id)
+        
+        if 'spreadsheet' not in config:
+            await interaction.followup.send(
+                "❌ No spreadsheet configured. Use `/set_spreadsheet_org_role` first.", 
+                ephemeral=True
+            )
+            return
+        
+        spreadsheet_data = config['spreadsheet']
+        teams = await fetch_sheet_data(
+            spreadsheet_data['url'],
+            spreadsheet_data['team_name_column'],
+            spreadsheet_data['captain_id_column']
+        )
+        
+        if not teams:
+            await interaction.followup.send(
+                "❌ Could not fetch data from spreadsheet.", 
+                ephemeral=True
+            )
+            return
+        
+        # Check for duplicates
+        team_names = {}
+        captain_ids = {}
+        duplicate_names = []
+        duplicate_ids = []
+        
+        for team in teams:
+            name = team['name']
+            captain_id = team['captain_id']
+            
+            # Track team names
+            if name in team_names:
+                if name not in duplicate_names:
+                    duplicate_names.append(name)
+                team_names[name].append(captain_id)
+            else:
+                team_names[name] = [captain_id]
+            
+            # Track captain IDs
+            if captain_id in captain_ids:
+                if captain_id not in duplicate_ids:
+                    duplicate_ids.append(captain_id)
+                captain_ids[captain_id].append(name)
+            else:
+                captain_ids[captain_id] = [name]
+        
+        # Build result embed
+        if not duplicate_names and not duplicate_ids:
+            embed = discord.Embed(
+                title="✅ No Duplicates Found",
+                description=f"Checked **{len(teams)}** teams - all entries are unique!",
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="⚠️ Duplicates Found",
+                description=f"Found duplicate entries in the spreadsheet",
+                color=discord.Color.orange()
+            )
+            
+            if duplicate_names:
+                dup_text = "\n".join([f"• **{name}** ({len(team_names[name])} times)" 
+                                     for name in duplicate_names[:10]])
+                if len(duplicate_names) > 10:
+                    dup_text += f"\n... and {len(duplicate_names) - 10} more"
+                embed.add_field(name=f"Duplicate Team Names ({len(duplicate_names)})", 
+                              value=dup_text, inline=False)
+            
+            if duplicate_ids:
+                dup_text = "\n".join([f"• **{id}** ({len(captain_ids[id])} teams)" 
+                                     for id in duplicate_ids[:10]])
+                if len(duplicate_ids) > 10:
+                    dup_text += f"\n... and {len(duplicate_ids) - 10} more"
+                embed.add_field(name=f"Duplicate Captain IDs ({len(duplicate_ids)})", 
+                              value=dup_text, inline=False)
+        
+        embed.add_field(name="Total Teams", value=str(len(teams)), inline=True)
+        embed.add_field(name="Unique Names", value=str(len(team_names)), inline=True)
+        embed.add_field(name="Unique Captains", value=str(len(captain_ids)), inline=True)
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Org Role Management")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in check_duplicates_org_role: {e}")
+        await interaction.followup.send(
+            f"❌ An error occurred while checking duplicates: {e}", 
+            ephemeral=True
+        )
+
+
+@tree.command(name="post_participants_org_role", description="Post participant list to the configured channel (Organizer only)")
+@app_commands.describe(
+    title="Title for the participant list (optional)"
+)
+async def post_participants_org_role(interaction: discord.Interaction, title: str = "Tournament Participants"):
+    """Post the participant list to the configured channel"""
+    try:
+        # Check permissions
+        if not has_organizer_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You need Organizer role to use this command.", 
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        guild_id = str(interaction.guild.id)
+        config = get_org_role_config(guild_id)
+        
+        # Check if channel is configured
+        if 'channel_id' not in config:
+            await interaction.followup.send(
+                "❌ No channel configured. Use `/set_channel_org_role` first.", 
+                ephemeral=True
+            )
+            return
+        
+        # Check if spreadsheet is configured
+        if 'spreadsheet' not in config:
+            await interaction.followup.send(
+                "❌ No spreadsheet configured. Use `/set_spreadsheet_org_role` first.", 
+                ephemeral=True
+            )
+            return
+        
+        # Fetch team data
+        spreadsheet_data = config['spreadsheet']
+        teams = await fetch_sheet_data(
+            spreadsheet_data['url'],
+            spreadsheet_data['team_name_column'],
+            spreadsheet_data['captain_id_column']
+        )
+        
+        if not teams:
+            await interaction.followup.send(
+                "❌ Could not fetch data from spreadsheet.", 
+                ephemeral=True
+            )
+            return
+        
+        # Get the target channel
+        channel = interaction.guild.get_channel(config['channel_id'])
+        if not channel:
+            await interaction.followup.send(
+                "❌ Configured channel not found. Please reconfigure using `/set_channel_org_role`.", 
+                ephemeral=True
+            )
+            return
+        
+        # Create participant list embed
+        embed = discord.Embed(
+            title=f"📋 {title}",
+            description=f"Total Participants: **{len(teams)}**",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        
+        # Split teams into multiple fields if needed (max 25 fields, max 1024 chars per field)
+        teams_per_field = 20
+        for i in range(0, len(teams), teams_per_field):
+            chunk = teams[i:i + teams_per_field]
+            field_value = "\n".join([f"{i+j+1}. **{team['name']}** - <@{team['captain_id']}>" 
+                                    for j, team in enumerate(chunk)])
+            
+            field_name = f"Teams {i+1}-{i+len(chunk)}" if len(teams) > teams_per_field else "Teams"
+            embed.add_field(name=field_name, value=field_value, inline=False)
+        
+        embed.set_footer(text=f"{ORGANIZATION_NAME} • Posted by {interaction.user.name}")
+        
+        # Post to channel
+        posted_message = await channel.send(embed=embed)
+        
+        # Track the posted message
+        add_org_role_posted_message(
+            guild_id,
+            posted_message.id,
+            channel.id,
+            {'teams': teams, 'title': title}
+        )
+        
+        # Send confirmation
+        confirm_embed = discord.Embed(
+            title="✅ Participants Posted Successfully",
+            description=f"Posted {len(teams)} participants to {channel.mention}",
+            color=discord.Color.green()
+        )
+        confirm_embed.add_field(name="Message Link", 
+                               value=f"[Jump to Message]({posted_message.jump_url})", 
+                               inline=False)
+        
+        await interaction.followup.send(embed=confirm_embed)
+        
+    except Exception as e:
+        print(f"Error in post_participants_org_role: {e}")
+        await interaction.followup.send(
+            f"❌ An error occurred while posting participants: {e}", 
+            ephemeral=True
+        )
+
+
+@tree.command(name="update_team_info_org_role", description="Update team info in posted participant messages (Organizer only)")
+@app_commands.describe(
+    identifier="Team name or Captain Discord ID to update",
+    new_team_name="New team name (optional - leave blank to keep current)",
+    new_captain_id="New captain Discord ID (optional - leave blank to keep current)"
+)
+async def update_team_info_org_role(
+    interaction: discord.Interaction,
+    identifier: str,
+    new_team_name: str = None,
+    new_captain_id: str = None
+):
+    """Update team information in previously posted participant messages"""
+    try:
+        # Check permissions
+        if not has_organizer_permission(interaction):
+            await interaction.response.send_message(
+                "❌ You need Organizer role to use this command.", 
+                ephemeral=True
+            )
+            return
+        
+        if not new_team_name and not new_captain_id:
+            await interaction.response.send_message(
+                "❌ Please provide at least one field to update (team name or captain ID).", 
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        guild_id = str(interaction.guild.id)
+        config = get_org_role_config(guild_id)
+        
+        # Check if spreadsheet is configured
+        if 'spreadsheet' not in config:
+            await interaction.followup.send(
+                "❌ No spreadsheet configured. Use `/set_spreadsheet_org_role` first.", 
+                ephemeral=True
+            )
+            return
+        
+        # Fetch current team data
+        spreadsheet_data = config['spreadsheet']
+        teams = await fetch_sheet_data(
+            spreadsheet_data['url'],
+            spreadsheet_data['team_name_column'],
+            spreadsheet_data['captain_id_column']
+        )
+        
+        if not teams:
+            await interaction.followup.send(
+                "❌ Could not fetch data from spreadsheet.", 
+                ephemeral=True
+            )
+            return
+        
+        # Find the team to update
+        team_found = None
+        team_index = -1
+        for i, team in enumerate(teams):
+            if team['name'].lower() == identifier.lower() or team['captain_id'] == identifier:
+                team_found = team
+                team_index = i
+                break
+        
+        if not team_found:
+            await interaction.followup.send(
+                f"❌ Team not found with identifier: `{identifier}`", 
+                ephemeral=True
+            )
+            return
+        
+        # Update team data
+        old_name = team_found['name']
+        old_captain = team_found['captain_id']
+        
+        if new_team_name:
+            teams[team_index]['name'] = new_team_name
+        if new_captain_id:
+            teams[team_index]['captain_id'] = new_captain_id
+        
+        # Get all posted messages and update them
+        posted_messages = get_org_role_posted_messages(guild_id)
+        updated_count = 0
+        
+        for msg_data in posted_messages:
+            try:
+                channel = interaction.guild.get_channel(msg_data['channel_id'])
+                if not channel:
+                    continue
+                
+                message = await channel.fetch_message(msg_data['message_id'])
+                if not message or not message.embeds:
+                    continue
+                
+                # Update the message embed
+                embed = message.embeds[0]
+                
+                # Reconstruct participant list with updated data
+                title = msg_data['team_data'].get('title', 'Tournament Participants')
+                new_embed = discord.Embed(
+                    title=f"📋 {title}",
+                    description=f"Total Participants: **{len(teams)}**\n*Last updated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.datetime.utcnow()
+                )
+                
+                # Split teams into fields
+                teams_per_field = 20
+                for i in range(0, len(teams), teams_per_field):
+                    chunk = teams[i:i + teams_per_field]
+                    field_value = "\n".join([f"{i+j+1}. **{team['name']}** - <@{team['captain_id']}>" 
+                                            for j, team in enumerate(chunk)])
+                    
+                    field_name = f"Teams {i+1}-{i+len(chunk)}" if len(teams) > teams_per_field else "Teams"
+                    new_embed.add_field(name=field_name, value=field_value, inline=False)
+                
+                new_embed.set_footer(text=f"{ORGANIZATION_NAME} • Last updated by {interaction.user.name}")
+                
+                await message.edit(embed=new_embed)
+                
+                # Update stored message data
+                update_org_role_posted_message(guild_id, message.id, {'teams': teams, 'title': title})
+                updated_count += 1
+                
+            except Exception as e:
+                print(f"Error updating message {msg_data['message_id']}: {e}")
+                continue
+        
+        # Send confirmation
+        embed = discord.Embed(
+            title="✅ Team Information Updated",
+            description=f"Updated team information and refreshed {updated_count} posted message(s)",
+            color=discord.Color.green()
+        )
+        
+        changes = []
+        if new_team_name:
+            changes.append(f"**Name:** `{old_name}` → `{new_team_name}`")
+        if new_captain_id:
+            changes.append(f"**Captain:** <@{old_captain}> → <@{new_captain_id}>")
+        
+        embed.add_field(name="Changes Made", value="\n".join(changes), inline=False)
+        embed.add_field(name="Messages Updated", value=str(updated_count), inline=True)
+        embed.add_field(name="Updated by", value=interaction.user.mention, inline=True)
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Error in update_team_info_org_role: {e}")
+        await interaction.followup.send(
+            f"❌ An error occurred while updating team info: {e}", 
+            ephemeral=True
+        )
 
 
 if __name__ == "__main__":

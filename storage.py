@@ -11,10 +11,12 @@ import datetime
 SCHEDULED_EVENTS_FILE = 'scheduled_events.json'
 RULES_FILE = 'tournament_rules.json'
 TOUR_PANEL_CONFIG_FILE = 'tour_panel_config.json'
+ORG_ROLE_CONFIG_FILE = 'org_role_config.json'
 
 # Global storage
 scheduled_events = {}
 tournament_rules = {}
+org_role_config = {}
 
 def load_scheduled_events():
     """Load scheduled events from file on startup"""
@@ -123,4 +125,108 @@ def set_rules_content(content, user_id, username):
     }
     
     return save_rules()
+
+# ===========================================================================================
+# ORG ROLE CONFIGURATION MANAGEMENT
+# ===========================================================================================
+
+def load_org_role_config() -> dict:
+    """Load organization role configuration from file"""
+    global org_role_config
+    try:
+        if os.path.exists(ORG_ROLE_CONFIG_FILE):
+            with open(ORG_ROLE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                org_role_config = json.load(f)
+                print(f"Loaded org role configuration from file")
+                return org_role_config
+    except Exception as e:
+        print(f"Error loading org role config: {e}")
+    org_role_config = {}
+    return org_role_config
+
+def save_org_role_config() -> bool:
+    """Save organization role configuration to file"""
+    try:
+        with open(ORG_ROLE_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(org_role_config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error saving org role config: {e}")
+        return False
+
+def get_org_role_config(guild_id: str) -> dict:
+    """Get org role config for a specific guild"""
+    return org_role_config.get(guild_id, {})
+
+def set_org_role_channel(guild_id: str, channel_id: int, user_id: int) -> bool:
+    """Set the channel for org role participant posts"""
+    global org_role_config
+    
+    if guild_id not in org_role_config:
+        org_role_config[guild_id] = {}
+    
+    org_role_config[guild_id]['channel_id'] = channel_id
+    org_role_config[guild_id]['last_updated'] = datetime.datetime.utcnow().isoformat()
+    org_role_config[guild_id]['updated_by'] = user_id
+    
+    return save_org_role_config()
+
+def set_org_role_spreadsheet(guild_id: str, spreadsheet_url: str, team_name_col: str, 
+                             captain_id_col: str, user_id: int) -> bool:
+    """Set the spreadsheet configuration for org role"""
+    global org_role_config
+    
+    if guild_id not in org_role_config:
+        org_role_config[guild_id] = {}
+    
+    org_role_config[guild_id]['spreadsheet'] = {
+        'url': spreadsheet_url,
+        'team_name_column': team_name_col,
+        'captain_id_column': captain_id_col
+    }
+    org_role_config[guild_id]['last_updated'] = datetime.datetime.utcnow().isoformat()
+    org_role_config[guild_id]['updated_by'] = user_id
+    
+    return save_org_role_config()
+
+def add_org_role_posted_message(guild_id: str, message_id: int, channel_id: int, 
+                                 team_data: dict) -> bool:
+    """Track a posted participant message for later updates"""
+    global org_role_config
+    
+    if guild_id not in org_role_config:
+        org_role_config[guild_id] = {}
+    
+    if 'posted_messages' not in org_role_config[guild_id]:
+        org_role_config[guild_id]['posted_messages'] = []
+    
+    org_role_config[guild_id]['posted_messages'].append({
+        'message_id': message_id,
+        'channel_id': channel_id,
+        'team_data': team_data,
+        'posted_at': datetime.datetime.utcnow().isoformat()
+    })
+    
+    return save_org_role_config()
+
+def get_org_role_posted_messages(guild_id: str) -> list:
+    """Get all posted participant messages for a guild"""
+    config = org_role_config.get(guild_id, {})
+    return config.get('posted_messages', [])
+
+def update_org_role_posted_message(guild_id: str, message_id: int, new_team_data: dict) -> bool:
+    """Update team data for a posted message"""
+    global org_role_config
+    
+    if guild_id not in org_role_config:
+        return False
+    
+    messages = org_role_config[guild_id].get('posted_messages', [])
+    for msg in messages:
+        if msg['message_id'] == message_id:
+            msg['team_data'] = new_team_data
+            msg['updated_at'] = datetime.datetime.utcnow().isoformat()
+            return save_org_role_config()
+    
+    return False
 

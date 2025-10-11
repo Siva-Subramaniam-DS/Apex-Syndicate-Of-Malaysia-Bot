@@ -17,7 +17,7 @@ ROLE_IDS = {
     "judge": 1261723119257915412,        # Judge role
     "bot_op": 1242280627991220275,       # Bot operator role
     "organizer": 1314905337437880340,    # Organizer role
-    "bot_admin": 1242280443898761236     # Bot admin role (full server permissions)
+    "bot_admin": [1242280443898761236, 981116079269109760]     # Bot admin role (full server permissions)
 }
 
 # Branding constants
